@@ -1,0 +1,1532 @@
+---
+title: "Pre–Post Survey Analysis"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    number_sections: true
+    df_print: paged
+  word_document:
+    toc: true
+    toc_depth: '3'
+  pdf_document:
+    toc: true
+    toc_depth: '3'
+---
+
+```{css, echo=FALSE}
+/* ── Visual polish for the HTML output ───────────────────────────────────── */
+h1.title          { font-size: 2rem; font-weight: 700; }
+.section-label    { color: #2c7be5; font-weight: 600; }
+table             { font-size: 0.9rem; }
+.sig              { color: #e63946; font-weight: bold; }
+.nosig            { color: #6c757d; }
+.callout          { background: #f0f4ff; border-left: 4px solid #2c7be5;
+                    padding: 0.75rem 1rem; margin-bottom: 1rem;
+                    border-radius: 0 4px 4px 0; }
+```
+
+---
+
+<div class="callout">
+**How to use this document**
+
+1. Fill in the **Configuration** block in Section 1 (at minimum, verify `QUESTION_COL` matches your data).
+2. Run `superset_connection.R` once to pull data from Apache Superset and cache it as CSVs.
+   Alternatively, place pre-exported CSVs directly in the `data_cache/` folder.
+3. Click **Knit** — the report regenerates automatically every time.
+
+Column names are detected automatically from `pre_` / `post_` prefixes; no other code edits are required for typical datasets.
+</div>
+
+---
+
+# Setup & Configuration {.tabset}
+
+## Package Installation & Loading
+
+```{r setup, message=FALSE, warning=FALSE}
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 1 — SETUP
+#
+# This chunk:
+#   1. Ensures all required R packages are installed (safe to re-run).
+#   2. Loads every package into the session.
+#   3. Sets global knit options (figure size, warnings, etc.).
+#   4. Defines the colour palette and significance threshold used throughout.
+#
+# Packages used and why:
+#   dplyr / tidyr  — data manipulation and reshaping
+#   ggplot2        — all visualisations
+#   scales         — axis formatting helpers (percent labels, etc.)
+#   knitr / kableExtra — formatted tables inside the HTML/Word output
+#   purrr          — functional helpers (map, keep, etc.)
+#   stringr        — string manipulation (str_replace, str_to_title, etc.)
+#   rstatix        — tidy-friendly statistical tests (not directly called
+#                    but kept for optional extensions)
+#   effectsize     — standardised effect-size calculations (e.g. Cohen's d)
+# ══════════════════════════════════════════════════════════════════════════════
+
+required_pkgs <- c(
+  "dplyr", "tidyr", "ggplot2", "scales",
+  "knitr", "kableExtra", "purrr", "stringr",
+  "rstatix", "effectsize"
+)
+
+# Install any packages that are not yet present — runs only on first use
+new_pkgs <- required_pkgs[!sapply(required_pkgs, requireNamespace, quietly = TRUE)]
+if (length(new_pkgs) > 0) {
+  message("Installing missing packages: ", paste(new_pkgs, collapse = ", "))
+  install.packages(new_pkgs, repos = "https://cloud.r-project.org", quiet = TRUE)
+}
+invisible(lapply(required_pkgs, library, character.only = TRUE))
+
+# ── Global knitr options ──────────────────────────────────────────────────────
+knitr::opts_chunk$set(
+  echo    = TRUE,    # show code in output (set FALSE to hide from readers)
+  warning = FALSE,   # suppress package/function warnings in output
+  message = FALSE,   # suppress info messages in output
+  fig.width  = 9,
+  fig.height = 5.5,
+  dpi        = 150
+)
+
+# ── Colour palette ────────────────────────────────────────────────────────────
+# Teal (pre) and orange (post) — distinguishable by most colour-blind viewers.
+PAL <- c(pre = "#0077b6", post = "#f4a261")
+
+# ── Significance threshold (α) ────────────────────────────────────────────────
+# p-values below this level are flagged as statistically significant.
+ALPHA <- 0.05
+```
+
+## Configuration
+
+```{r config}
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 2 — CONFIGURATION  ← EDIT THIS BLOCK
+#
+# All user-adjustable settings live here so that the rest of the document
+# never needs to be touched between analysis runs.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Name of the column that identifies each survey question (the row label).
+# Common values: "question", "item", "question_text", "label"
+# If this value doesn't match your data, the script auto-detects the right
+# column and prints a warning — update this value to silence that warning.
+QUESTION_COL <- "question"
+
+# Optional: a character vector of question IDs to EXCLUDE from all analyses.
+# Example: EXCLUDE_QUESTIONS <- c("Q99", "warm_up_item")
+EXCLUDE_QUESTIONS <- c()
+
+# Optional: a separate column with prettier question labels for axis text.
+# Set to NULL to use QUESTION_COL as-is.
+LABEL_COL <- NULL
+
+# Likert scale range used in the survey.
+# Used in the average-score change plot subtitle. Adjust if using a 7-point scale.
+LIKERT_MIN <- 1
+LIKERT_MAX <- 5
+
+# Report title — appears in the summary table header.
+REPORT_TITLE <- "Pre–Post Survey Results"
+```
+
+---
+
+# Helper Functions & Unit Tests {.tabset}
+
+## Helper Definitions
+
+```{r helpers}
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 3 — HELPER FUNCTIONS
+#
+# All reusable utility functions are defined here, before they are called,
+# so they can also be unit-tested in the next chunk.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+# log_msg() prints a timestamped diagnostic line to the console.
+# Use it any time a meaningful decision or data shape is worth recording.
+log_msg <- function(..., level = "INFO") {
+  ts <- format(Sys.time(), "%H:%M:%S")
+  cat(sprintf("[%s] [%s] %s\n", ts, level, paste0(...)))
+}
+
+# ── Column-pair detection ─────────────────────────────────────────────────────
+# detect_pairs() scans a data frame for columns whose names start with "pre_"
+# and "post_" and returns those that form matched pairs (same stem after
+# stripping the prefix). The function also reports unmatched one-sided columns
+# so you can spot data-structure issues early.
+#
+# Returns a named list:
+#   $pre      — full pre-column names of matched pairs (e.g. "pre_score")
+#   $post     — full post-column names of matched pairs (e.g. "post_score")
+#   $stems    — shared stems (e.g. "score")
+#   $pre_only — stems found only in pre columns (no matching post)
+#   $post_only— stems found only in post columns (no matching pre)
+detect_pairs <- function(df) {
+  pre_cols   <- grep("^pre_",  names(df), value = TRUE)
+  post_cols  <- grep("^post_", names(df), value = TRUE)
+  pre_stems  <- sub("^pre_",  "", pre_cols)
+  post_stems <- sub("^post_", "", post_cols)
+  matched    <- intersect(pre_stems, post_stems)
+  list(
+    pre       = paste0("pre_",  matched),
+    post      = paste0("post_", matched),
+    stems     = matched,
+    pre_only  = setdiff(pre_stems,  post_stems),
+    post_only = setdiff(post_stems, pre_stems)
+  )
+}
+
+# ── Question-column auto-detection ────────────────────────────────────────────
+# detect_q_col() tries to find the column that serves as the row identifier
+# (survey question label). It first checks a list of common names, then falls
+# back to the first column that doesn't have a pre_/post_ prefix.
+detect_q_col <- function(df) {
+  candidates <- c(
+    "question", "Question", "question_text", "Question Text",
+    "item", "Item", "label", "Label", "survey_question",
+    "row_label", "name", "Name", "description", "metric"
+  )
+  found <- intersect(candidates, names(df))
+  if (length(found) > 0) return(found[1])
+  # Fall back to the first non-metric column
+  other <- names(df)[!grepl("^(pre_|post_)", names(df))]
+  if (length(other) > 0) return(other[1])
+  return(names(df)[1])   # last resort
+}
+
+# ── Cramér's V ────────────────────────────────────────────────────────────────
+# Cramér's V is a standardised effect size for chi-square tests.
+# Formula: V = sqrt( chi2 / (n * (k - 1)) )
+#   chi2 — chi-square statistic from chisq.test()
+#   n    — total number of observations (sum of all cell counts)
+#   k    — number of categories (columns in the contingency table)
+# Interpretation benchmarks: 0.10 = small, 0.30 = medium, 0.50 = large
+cramers_v <- function(chi2, n, k) {
+  # Guard against degenerate cases that produce NaN
+  if (n <= 0 || k <= 1) return(NA_real_)
+  sqrt(chi2 / (n * (k - 1)))
+}
+
+# ── Safe numeric extraction ───────────────────────────────────────────────────
+# safe_num() converts a value to numeric, returning NA rather than throwing
+# an error when conversion fails. This handles cells that contain empty
+# strings, "N/A", or other non-numeric text from Superset exports.
+safe_num <- function(x) suppressWarnings(as.numeric(x))
+
+# ── Significance star formatter ───────────────────────────────────────────────
+# sig_flag() converts a logical (TRUE/FALSE/NA) into a readable flag string.
+sig_flag <- function(x) {
+  dplyr::case_when(
+    is.na(x)  ~ "—",
+    x == TRUE ~ "✓ Yes",
+    TRUE      ~ "No"
+  )
+}
+```
+
+## Unit Tests
+
+```{r unit-tests}
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 4 — UNIT TESTS
+#
+# These tests run automatically every time the document is knitted.
+# They verify that helper functions behave correctly with known inputs.
+# A failure here means a helper function was accidentally broken —
+# check any recent edits to the helpers chunk above.
+#
+# Each test uses stopifnot(), which halts execution with a clear message
+# if the assertion is FALSE. The cat() lines provide progress visibility.
+# ══════════════════════════════════════════════════════════════════════════════
+
+cat("Running unit tests for helper functions...\n\n")
+
+# ── Test: detect_pairs() ─────────────────────────────────────────────────────
+cat("  [TEST] detect_pairs()\n")
+test_df_pairs <- data.frame(
+  question   = c("Q1", "Q2"),
+  pre_score  = c(3.2, 4.1),
+  post_score = c(4.0, 4.5),
+  pre_count  = c(50L, 48L),
+  post_count = c(52L, 49L),
+  pre_delta  = c(0.8, 0.4)   # has pre_ prefix but no post_delta → lands in pre_only
+  # Note: detect_pairs only sees columns starting with pre_/post_, so a bare
+  # column named "delta" (no prefix) is invisible to it — hence pre_delta here.
+)
+pairs_test <- detect_pairs(test_df_pairs)
+stopifnot("detect_pairs finds 2 matched stems" =
+            length(pairs_test$stems) == 2)
+stopifnot("detect_pairs identifies 'score' stem" =
+            "score" %in% pairs_test$stems)
+stopifnot("detect_pairs identifies 'count' stem" =
+            "count" %in% pairs_test$stems)
+stopifnot("detect_pairs flags 'delta' as pre_only" =
+            "delta" %in% pairs_test$pre_only)
+stopifnot("detect_pairs pre_only and post_only are disjoint" =
+            length(intersect(pairs_test$pre_only, pairs_test$post_only)) == 0)
+cat("    PASSED\n")
+
+# ── Test: detect_q_col() ─────────────────────────────────────────────────────
+cat("  [TEST] detect_q_col()\n")
+stopifnot("detects 'question' by name" =
+            detect_q_col(data.frame(question="a", pre_x=1)) == "question")
+stopifnot("detects 'item' when 'question' absent" =
+            detect_q_col(data.frame(item="a", pre_x=1)) == "item")
+stopifnot("falls back to first non-pre/post col" =
+            detect_q_col(data.frame(pre_x=1, post_x=2, mykey="a")) == "mykey")
+cat("    PASSED\n")
+
+# ── Test: cramers_v() ────────────────────────────────────────────────────────
+cat("  [TEST] cramers_v()\n")
+# Known result: sqrt(10 / (100 * 2)) ≈ 0.2236
+expected_v <- sqrt(10 / (100 * 2))
+stopifnot("cramers_v produces correct numeric result" =
+            abs(cramers_v(10, 100, 3) - expected_v) < 1e-10)
+stopifnot("cramers_v returns NA for degenerate n=0" =
+            is.na(cramers_v(10, 0, 3)))
+stopifnot("cramers_v returns NA for degenerate k=1" =
+            is.na(cramers_v(10, 100, 1)))
+cat("    PASSED\n")
+
+# ── Test: safe_num() ─────────────────────────────────────────────────────────
+cat("  [TEST] safe_num()\n")
+stopifnot("safe_num converts numeric string" = safe_num("3.14") == 3.14)
+stopifnot("safe_num returns NA for non-numeric" = is.na(safe_num("N/A")))
+stopifnot("safe_num handles empty string" = is.na(safe_num("")))
+stopifnot("safe_num passes through numeric" = safe_num(42) == 42)
+cat("    PASSED\n")
+
+# ── Test: sig_flag() ─────────────────────────────────────────────────────────
+cat("  [TEST] sig_flag()\n")
+stopifnot("sig_flag TRUE → '✓ Yes'" = sig_flag(TRUE)  == "✓ Yes")
+stopifnot("sig_flag FALSE → 'No'"   = sig_flag(FALSE) == "No")
+stopifnot("sig_flag NA → '—'"       = sig_flag(NA)    == "—")
+cat("    PASSED\n")
+
+cat("\nAll unit tests passed.\n")
+```
+
+---
+
+# Data Import & Validation
+
+```{r import-data}
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 5 — DATA IMPORT
+#
+# Data is read from CSV files cached by superset_connection.R.
+# To refresh from Superset, uncomment the source() line below and comment
+# out the read.csv() block — or just re-run superset_connection.R first.
+#
+# check.names = FALSE preserves column names exactly as exported from
+# Superset (spaces, special characters, etc. are kept intact).
+# ══════════════════════════════════════════════════════════════════════════════
+
+log_msg("Starting data import from data_cache/")
+
+# ── Option A (live pull) ──────────────────────────────────────────────────────
+# Uncomment to pull fresh data from Superset before loading:
+# source("superset_connection.R")
+
+# ── Option B (cached CSVs — default) ─────────────────────────────────────────
+cache_path  <- "data_cache"
+cache_files <- list(
+  slider      = file.path(cache_path, "slider.csv"),
+  knowledge   = file.path(cache_path, "knowledge.csv"),
+  likert      = file.path(cache_path, "likert.csv"),
+  multiselect = file.path(cache_path, "multiselect.csv")
+)
+
+# Verify all cache files exist before attempting to read them
+missing_files <- names(cache_files)[!file.exists(unlist(cache_files))]
+if (length(missing_files) > 0) {
+  stop(
+    "Missing cache file(s): ", paste(missing_files, collapse = ", "), "\n",
+    "Run superset_connection.R first to generate the CSVs, ",
+    "or place them manually in the '", cache_path, "/' folder."
+  )
+}
+
+read_cache <- function(path) {
+  read.csv(path, stringsAsFactors = FALSE, check.names = FALSE)
+}
+
+df_slider      <- read_cache(cache_files$slider)
+df_knowledge   <- read_cache(cache_files$knowledge)
+df_likert      <- read_cache(cache_files$likert)
+df_multiselect <- read_cache(cache_files$multiselect)
+
+log_msg("Cache files loaded successfully")
+```
+
+```{r validate-data}
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 6 — DATA VALIDATION
+#
+# Before running any analysis, we verify that the data meets basic
+# structural requirements. Problems are reported as warnings (non-fatal)
+# so that the rest of the report still renders — making it easier to
+# diagnose issues incrementally.
+# ══════════════════════════════════════════════════════════════════════════════
+
+log_msg("Running data validation checks")
+
+# ── Helper: validate a single data frame ─────────────────────────────────────
+validate_df <- function(df, name) {
+  issues <- character(0)
+
+  if (nrow(df) == 0)
+    issues <- c(issues, "has 0 rows — data may not have loaded correctly")
+
+  if (ncol(df) == 0)
+    issues <- c(issues, "has 0 columns — check the CSV file")
+
+  # Flag columns that are entirely NA (useless for analysis)
+  all_na_cols <- names(df)[sapply(df, function(col) all(is.na(col)))]
+  if (length(all_na_cols) > 0)
+    issues <- c(issues, paste("all-NA columns:", paste(all_na_cols, collapse=", ")))
+
+  # Flag numeric-looking columns stored as character (common Superset export issue)
+  # vapply() is used instead of sapply() because it guarantees a logical vector
+  # as output — sapply() can silently return a list when columns loaded with
+  # check.names=FALSE have unusual types, causing "invalid subscript type 'list'".
+  # tryCatch() inside ensures any single problematic column returns FALSE safely.
+  pre_post_cols <- names(df)[grepl("^(pre_|post_)", names(df))]
+  char_num_cols <- if (length(pre_post_cols) == 0) character(0) else {
+    pre_post_cols[
+      vapply(pre_post_cols, function(col) {
+        tryCatch({
+          vals <- df[[col]]
+          is.character(vals) && !all(is.na(suppressWarnings(as.numeric(vals))))
+        }, error = function(e) FALSE)
+      }, logical(1))
+    ]
+  }
+  if (length(char_num_cols) > 0)
+    issues <- c(issues, paste("numeric values stored as character:",
+                              paste(char_num_cols, collapse=", "),
+                              "— conversion will be applied automatically"))
+
+  if (length(issues) > 0) {
+    for (iss in issues)
+      log_msg(name, ": ", iss, level = "WARN")
+  } else {
+    log_msg(name, ": OK (", nrow(df), " rows × ", ncol(df), " cols)")
+  }
+
+  invisible(df)
+}
+
+validate_df(df_slider,      "df_slider")
+validate_df(df_knowledge,   "df_knowledge")
+validate_df(df_likert,      "df_likert")
+validate_df(df_multiselect, "df_multiselect")
+
+# ── Auto-detect QUESTION_COL ─────────────────────────────────────────────────
+# If the configured QUESTION_COL doesn't exist in the knowledge data frame
+# (the primary reference), we scan for a sensible alternative.
+if (!QUESTION_COL %in% names(df_knowledge)) {
+  detected <- detect_q_col(df_knowledge)
+  log_msg(
+    "QUESTION_COL '", QUESTION_COL, "' not found — auto-detected: '",
+    detected, "'  |  Update QUESTION_COL in Section 1 to silence this.",
+    level = "WARN"
+  )
+  QUESTION_COL <- detected
+}
+log_msg("QUESTION_COL set to: '", QUESTION_COL, "'")
+
+# Warn if any dataset is missing QUESTION_COL (non-fatal — row index used instead)
+for (nm in c("df_slider", "df_knowledge", "df_likert", "df_multiselect")) {
+  df <- get(nm)
+  if (!QUESTION_COL %in% names(df))
+    log_msg(nm, " does not contain QUESTION_COL '", QUESTION_COL,
+            "' — row index will be used as label", level = "WARN")
+}
+
+# ── Apply exclusions ──────────────────────────────────────────────────────────
+# Remove any questions listed in EXCLUDE_QUESTIONS from all data frames.
+# This is useful for filtering out pilot questions, demographic items, etc.
+exclude_rows <- function(df) {
+  if (length(EXCLUDE_QUESTIONS) > 0 && QUESTION_COL %in% names(df))
+    df[!df[[QUESTION_COL]] %in% EXCLUDE_QUESTIONS, , drop = FALSE]
+  else
+    df
+}
+
+df_slider      <- exclude_rows(df_slider)
+df_knowledge   <- exclude_rows(df_knowledge)
+df_likert      <- exclude_rows(df_likert)
+df_multiselect <- exclude_rows(df_multiselect)
+
+if (length(EXCLUDE_QUESTIONS) > 0)
+  log_msg("Excluded ", length(EXCLUDE_QUESTIONS), " question(s): ",
+          paste(EXCLUDE_QUESTIONS, collapse = ", "))
+
+# ── Dimension summary ─────────────────────────────────────────────────────────
+cat("\nDataset dimensions after validation and exclusions:\n")
+cat(sprintf("  %-16s : %d rows × %d cols\n", "df_slider",      nrow(df_slider),      ncol(df_slider)))
+cat(sprintf("  %-16s : %d rows × %d cols\n", "df_knowledge",   nrow(df_knowledge),   ncol(df_knowledge)))
+cat(sprintf("  %-16s : %d rows × %d cols\n", "df_likert",      nrow(df_likert),      ncol(df_likert)))
+cat(sprintf("  %-16s : %d rows × %d cols\n", "df_multiselect", nrow(df_multiselect), ncol(df_multiselect)))
+```
+
+## Raw Data Preview
+
+```{r data-preview}
+# Quick look at the first few rows of each dataset.
+# This is useful for confirming column names match what the analysis expects.
+cat("── Perception Slider ──\n");  print(head(df_slider))
+cat("\n── Knowledge ──\n");        print(head(df_knowledge))
+cat("\n── Likert ──\n");           print(head(df_likert))
+cat("\n── Multi-Select ──\n");     print(head(df_multiselect))
+```
+
+---
+
+# Column Auto-Detection
+
+```{r detect-pairs}
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 7 — COLUMN AUTO-DETECTION
+#
+# We use the detect_pairs() helper (defined in Section 3) to identify every
+# pre_/post_ column pair in each dataset. The "stem" is the shared part of
+# the column name after stripping the prefix.
+#
+# Example: "pre_avg_score" and "post_avg_score" → stem = "avg_score"
+#
+# Columns without a matching counterpart are flagged as pre-only or post-only
+# so you can quickly spot data structure issues.
+# ══════════════════════════════════════════════════════════════════════════════
+
+log_msg("Detecting pre_/post_ column pairs")
+
+pairs_s <- detect_pairs(df_slider)
+pairs_k <- detect_pairs(df_knowledge)
+pairs_l <- detect_pairs(df_likert)
+pairs_m <- detect_pairs(df_multiselect)
+
+dataset_names <- c(Slider = "pairs_s", Knowledge = "pairs_k",
+                   Likert = "pairs_l", `Multi-Select` = "pairs_m")
+
+for (label in names(dataset_names)) {
+  p <- get(dataset_names[[label]])
+  cat(label, "— matched pairs (", length(p$stems), "):",
+      if (length(p$stems) > 0) paste(p$stems, collapse=", ") else "(none)", "\n")
+  if (length(p$pre_only)  > 0)
+    cat("    pre-only  :", paste(p$pre_only,  collapse=", "), "\n")
+  if (length(p$post_only) > 0)
+    cat("    post-only :", paste(p$post_only, collapse=", "), "\n")
+}
+```
+
+```{r classify-columns}
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 8 — COLUMN TYPE CLASSIFICATION
+#
+# Within each dataset, stems are further classified by their role
+# (score/average, count, percentage, delta) using regex pattern matching.
+# This drives which statistical tests and visualisations are applied.
+# ══════════════════════════════════════════════════════════════════════════════
+
+log_msg("Classifying column types within each dataset")
+
+# ── Perception Slider ─────────────────────────────────────────────────────────
+# Score columns contain average/mean values (continuous, used for comparisons).
+# Count columns hold numeric tallies (used if an n-based t-test is possible).
+s_score_stems <- pairs_s$stems[grepl("avg|mean|score|value",
+                                     pairs_s$stems, ignore.case = TRUE)]
+s_count_stems <- pairs_s$stems[!grepl("avg|mean|score|value|pct|percent|delta",
+                                      pairs_s$stems, ignore.case = TRUE)]
+
+# ── Knowledge ─────────────────────────────────────────────────────────────────
+# count_stems: raw correct/incorrect/total counts  → used in prop.test
+# pct_stems:   percentages                          → reported descriptively
+# delta_cols:  pre-computed change columns          → reported descriptively
+k_count_stems <- pairs_k$stems[!grepl("pct|percent|delta|avg|mean|score",
+                                      pairs_k$stems, ignore.case = TRUE)]
+k_pct_stems   <- pairs_k$stems[ grepl("pct|percent",
+                                      pairs_k$stems, ignore.case = TRUE)]
+k_delta_cols  <- grep("delta", names(df_knowledge), value = TRUE, ignore.case = TRUE)
+
+# ── Likert ────────────────────────────────────────────────────────────────────
+# Category stems (strongly_disagree … strongly_agree) form the contingency
+# table for the chi-square test.
+# Score stems hold the average Likert score per question.
+likert_cat_order <- c("strongly_disagree", "disagree", "neutral",
+                      "agree", "strongly_agree")
+l_cat_stems  <- intersect(likert_cat_order, pairs_l$stems)
+l_score_stem <- pairs_l$stems[grepl("avg|mean|score", pairs_l$stems,
+                                    ignore.case = TRUE)]
+
+# ── Multi-Select ──────────────────────────────────────────────────────────────
+# Option stems are the individual response options (each treated as a binary).
+# The total stem holds the total respondent count (denominator for percentages).
+m_option_stems <- pairs_m$stems[!grepl("pct|percent|delta|avg|mean|total",
+                                       pairs_m$stems, ignore.case = TRUE)]
+m_total_stem   <- pairs_m$stems[grepl("total", pairs_m$stems, ignore.case = TRUE)]
+m_total_stem   <- if (length(m_total_stem) > 0) m_total_stem[1] else NA_character_
+
+# ── Print classification summary ──────────────────────────────────────────────
+cat("\nSlider:\n")
+cat("  score stems  :", paste0(s_score_stems, collapse=", "), "\n")
+cat("  count stems  :", paste0(s_count_stems, collapse=", "), "\n")
+cat("\nKnowledge:\n")
+cat("  count stems  :", paste(k_count_stems, collapse=", "), "\n")
+cat("  pct stems    :", paste(k_pct_stems,   collapse=", "), "\n")
+cat("  delta cols   :", paste(k_delta_cols,  collapse=", "), "\n")
+cat("\nLikert:\n")
+cat("  category stems:", paste(l_cat_stems,  collapse=", "), "\n")
+cat("  score stems   :", paste(l_score_stem, collapse=", "), "\n")
+cat("\nMulti-Select:\n")
+cat("  option stems :", paste(m_option_stems, collapse=", "), "\n")
+cat("  total stem   :", m_total_stem, "\n")
+
+log_msg("Column classification complete")
+```
+
+---
+
+# Perception Slider Analysis
+
+> **Statistical method:** Descriptive comparison of pre vs. post mean scores
+> per question. Because only aggregate means are available (not individual
+> responses), a formal paired t-test cannot be applied. If your data also
+> contains standard deviation and sample-size columns, a two-sample Welch
+> t-test is run from the summary statistics. Otherwise, results are reported
+> descriptively with the raw change noted.
+
+## Statistical Tests
+
+```{r slider-stats}
+# ══════════════════════════════════════════════════════════════════════════════
+# Perception Slider: mean-score comparison
+#
+# For each question row we compare the pre and post mean scores.
+# If SD and N columns are present, a two-sample Welch t-test is computed
+# from the group summary statistics (mean, SD, n) rather than raw data.
+#
+# The Welch t-test does not assume equal variances between groups, making
+# it more robust than a standard Student's t-test for aggregate data.
+# ══════════════════════════════════════════════════════════════════════════════
+
+log_msg("Running Perception Slider analysis")
+
+# Identify the primary score column (first detected score stem)
+pre_s_col  <- if (length(s_score_stems) > 0) paste0("pre_",  s_score_stems[1]) else NULL
+post_s_col <- if (length(s_score_stems) > 0) paste0("post_", s_score_stems[1]) else NULL
+
+# Check for optional SD and N columns (enable t-test if found)
+pre_n_col   <- grep("^pre_(n|count|total|respondents)$",
+                    names(df_slider), value = TRUE, ignore.case = TRUE)[1]
+post_n_col  <- grep("^post_(n|count|total|respondents)$",
+                    names(df_slider), value = TRUE, ignore.case = TRUE)[1]
+pre_sd_col  <- grep("^pre_(sd|std|stdev)",
+                    names(df_slider), value = TRUE, ignore.case = TRUE)[1]
+post_sd_col <- grep("^post_(sd|std|stdev)",
+                    names(df_slider), value = TRUE, ignore.case = TRUE)[1]
+
+has_ttest_inputs <- !is.na(pre_n_col) && !is.na(post_n_col) &&
+                    !is.na(pre_sd_col) && !is.na(post_sd_col)
+
+log_msg("Slider — score cols: ", pre_s_col, " / ", post_s_col,
+        " | t-test inputs available: ", has_ttest_inputs)
+
+# ── Per-question test function ────────────────────────────────────────────────
+run_slider_test <- function(row) {
+  # Safe label extraction (falls back to row index if QUESTION_COL is absent)
+  q_label   <- if (QUESTION_COL %in% names(row) && !is.null(row[[QUESTION_COL]]))
+                 as.character(row[[QUESTION_COL]]) else paste0("Row_", rownames(row))
+  pre_mean  <- safe_num(row[[pre_s_col]])
+  post_mean <- safe_num(row[[post_s_col]])
+  diff      <- round(post_mean - pre_mean, 3)
+
+  if (has_ttest_inputs) {
+    # Two-sample Welch t-test from summary statistics
+    n1  <- safe_num(row[[pre_n_col]]);  n2  <- safe_num(row[[post_n_col]])
+    sd1 <- safe_num(row[[pre_sd_col]]); sd2 <- safe_num(row[[post_sd_col]])
+    se   <- sqrt(sd1^2 / n1 + sd2^2 / n2)
+    t    <- diff / se
+    df_t <- (sd1^2/n1 + sd2^2/n2)^2 /
+            ((sd1^2/n1)^2/(n1-1) + (sd2^2/n2)^2/(n2-1))
+    p    <- 2 * pt(-abs(t), df_t)
+    # Cohen's d using pooled SD
+    sp   <- sqrt(((n1-1)*sd1^2 + (n2-1)*sd2^2) / (n1+n2-2))
+    d    <- round(diff / sp, 3)
+    data.frame(question=q_label,
+               pre_mean=round(pre_mean,2), post_mean=round(post_mean,2),
+               diff=diff, p_value=round(p,4), cohens_d=d,
+               significant=p < ALPHA, method="Welch t-test",
+               stringsAsFactors=FALSE)
+  } else {
+    # Descriptive only — Cohen's d cannot be computed without SD
+    data.frame(question=q_label,
+               pre_mean=round(pre_mean,2), post_mean=round(post_mean,2),
+               diff=diff, p_value=NA_real_, cohens_d=NA_real_,
+               significant=NA, method="Descriptive (no SD available)",
+               stringsAsFactors=FALSE)
+  }
+}
+
+# ── Run across all rows ───────────────────────────────────────────────────────
+if (is.null(pre_s_col)) {
+  log_msg("No score columns found in df_slider — skipping slider analysis", level="WARN")
+  results_slider <- data.frame()
+} else {
+  results_slider <- bind_rows(
+    lapply(seq_len(nrow(df_slider)), function(i) run_slider_test(df_slider[i, ]))
+  )
+  n_sig <- sum(results_slider$significant == TRUE, na.rm = TRUE)
+  log_msg("Slider: ", nrow(results_slider), " questions | ", n_sig, " significant")
+
+  # ── Results table ───────────────────────────────────────────────────────────
+  results_slider %>%
+    mutate(
+      diff     = paste0(ifelse(diff >= 0, "+", ""), diff),
+      sig_flag = sig_flag(significant)
+    ) %>%
+    select(question, pre_mean, post_mean, diff, p_value, cohens_d, sig_flag, method) %>%
+    kable(
+      col.names = c("Question", "Pre Mean", "Post Mean", "Change",
+                    "p-value", "Cohen's d", "Significant?", "Method"),
+      caption   = "Perception Slider: Pre vs. Post Mean Score Comparison"
+    ) %>%
+    kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                  full_width = FALSE) %>%
+    row_spec(which(results_slider$significant == TRUE),
+             bold = TRUE, color = "#e63946")
+}
+```
+
+## Visualisation — Score Change
+
+```{r slider-plot, fig.height=max(4, nrow(df_slider) * 0.55 + 1.5)}
+# Grouped horizontal bar chart comparing pre vs. post mean score per question.
+# Questions with a statistically significant change are starred (*).
+if (nrow(results_slider) > 0) {
+  # Reshape to long format for ggplot (one row per question × time point)
+  plot_s <- results_slider %>%
+    select(question, pre_mean, post_mean) %>%
+    pivot_longer(c(pre_mean, post_mean), names_to = "time", values_to = "score") %>%
+    mutate(
+      time = recode(time, pre_mean = "Pre", post_mean = "Post"),
+      time = factor(time, levels = c("Pre", "Post"))
+    )
+
+  # Add a "*" to labels for statistically significant questions
+  sig_lbl_s <- results_slider %>%
+    mutate(label = ifelse(!is.na(significant) & significant,
+                          paste0(question, " *"), question)) %>%
+    select(question, label)
+  plot_s <- left_join(plot_s, sig_lbl_s, by = "question")
+
+  ggplot(plot_s, aes(x = score, y = reorder(label, score), fill = time)) +
+    geom_col(position = position_dodge(width = 0.7), width = 0.6, colour = "white") +
+    geom_text(aes(label = round(score, 2)),
+              position = position_dodge(width = 0.7), hjust = -0.15, size = 3.2) +
+    scale_fill_manual(values = PAL, name = "Time point") +
+    scale_x_continuous(expand = expansion(mult = c(0, 0.2))) +
+    labs(
+      title    = "Perception Slider: Mean Score Pre vs. Post",
+      subtitle = "* statistically significant change (p < 0.05)",
+      x = "Mean Score", y = NULL
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(legend.position = "top", panel.grid.major.y = element_blank())
+}
+```
+
+---
+
+# Knowledge Questions Analysis
+
+> **Statistical method:** Two-proportion z-test (`prop.test`) comparing
+> the proportion of correct responses at pre vs. post for each question.
+> This test is appropriate when we have aggregate counts (correct, total)
+> rather than individual-level binary responses.
+> Effect size is reported as the absolute percentage-point change.
+
+## Statistical Tests
+
+```{r knowledge-stats}
+# ══════════════════════════════════════════════════════════════════════════════
+# Knowledge: two-proportion z-test
+#
+# For each question we compute:
+#   Pre proportion  = pre_correct  / pre_total
+#   Post proportion = post_correct / post_total
+#
+# prop.test() is equivalent to a chi-square test on a 2×2 table and produces
+# a p-value for H₀: p_pre = p_post (proportions are equal).
+#
+# Note: if your data only has pre_total (no post_total), the script reuses
+# pre_total as the denominator for both time points — valid when the same
+# cohort answered both waves.
+# ══════════════════════════════════════════════════════════════════════════════
+
+log_msg("Running Knowledge analysis")
+
+# ── Identify correct / total column stems ─────────────────────────────────────
+correct_stem <- k_count_stems[grepl("correct",  k_count_stems, ignore.case = TRUE)][1]
+total_stem   <- k_count_stems[grepl("total",    k_count_stems, ignore.case = TRUE)][1]
+
+# ── Fallback: look for total in pre-only columns ──────────────────────────────
+# Handles the common case where "pre_total" exists but "post_total" was not
+# exported, because the same cohort answered both survey waves.
+if (is.na(total_stem) && length(pairs_k$pre_only) > 0) {
+  pre_only_total <- pairs_k$pre_only[grepl("total", pairs_k$pre_only, ignore.case = TRUE)]
+  if (length(pre_only_total) > 0) {
+    total_stem <- pre_only_total[1]
+    log_msg("No post_total found — reusing pre_total for both denominators", level = "WARN")
+  }
+}
+
+# Halt if we still can't find the essential columns
+if (is.na(correct_stem) || is.na(total_stem)) {
+  stop(
+    "Could not auto-detect 'correct' and 'total' count columns in df_knowledge.\n",
+    "Available stems (matched pairs): ", paste(k_count_stems, collapse=", "), "\n",
+    "Pre-only stems: ", paste(pairs_k$pre_only, collapse=", "), "\n",
+    "Ensure your knowledge data has columns named like: ",
+    "pre_correct, post_correct, pre_total (and optionally post_total)."
+  )
+}
+
+# Build full column names from stems
+pre_correct_col  <- paste0("pre_",  correct_stem)
+post_correct_col <- paste0("post_", correct_stem)
+pre_total_col    <- paste0("pre_",  total_stem)
+# Use post_total if it exists, otherwise fall back to pre_total
+post_total_col   <- if (paste0("post_", total_stem) %in% names(df_knowledge))
+                      paste0("post_", total_stem) else pre_total_col
+
+log_msg("Knowledge — correct: ", pre_correct_col, "/", post_correct_col,
+        " | total: ", pre_total_col, "/", post_total_col)
+
+# ── Per-question prop.test ────────────────────────────────────────────────────
+run_prop_test <- function(row) {
+  q_label <- if (QUESTION_COL %in% names(row) && !is.null(row[[QUESTION_COL]]))
+               as.character(row[[QUESTION_COL]]) else paste0("Row_", rownames(row))
+
+  x1 <- safe_num(row[[pre_correct_col]])
+  n1 <- safe_num(row[[pre_total_col]])
+  x2 <- safe_num(row[[post_correct_col]])
+  n2 <- safe_num(row[[post_total_col]])
+
+  # Skip rows where required values are missing or denominator is zero
+  if (any(is.na(c(x1, n1, x2, n2))) || n1 == 0 || n2 == 0)
+    return(data.frame(
+      question=q_label, pre_pct=NA_real_, post_pct=NA_real_,
+      pct_point_diff=NA_real_, p_value=NA_real_,
+      significant=NA, note="Missing data", stringsAsFactors=FALSE
+    ))
+
+  test <- tryCatch(
+    prop.test(c(x1, x2), c(n1, n2), correct = FALSE),
+    error = function(e) NULL
+  )
+
+  data.frame(
+    question       = q_label,
+    pre_pct        = round(x1 / n1 * 100, 1),
+    post_pct       = round(x2 / n2 * 100, 1),
+    pct_point_diff = round((x2/n2 - x1/n1) * 100, 1),   # positive = improvement
+    p_value        = if (!is.null(test)) round(test$p.value, 4) else NA_real_,
+    significant    = if (!is.null(test)) test$p.value < ALPHA else NA,
+    note           = "",
+    stringsAsFactors = FALSE
+  )
+}
+
+results_knowledge <- bind_rows(
+  lapply(seq_len(nrow(df_knowledge)), function(i) run_prop_test(df_knowledge[i, ]))
+)
+
+n_sig_k <- sum(results_knowledge$significant == TRUE, na.rm = TRUE)
+log_msg("Knowledge: ", nrow(results_knowledge), " questions | ", n_sig_k, " significant")
+
+# ── Results table ─────────────────────────────────────────────────────────────
+results_knowledge %>%
+  mutate(
+    pre_pct_fmt  = paste0(pre_pct,  "%"),
+    post_pct_fmt = paste0(post_pct, "%"),
+    change_fmt   = paste0(ifelse(pct_point_diff >= 0, "+", ""),
+                          pct_point_diff, "pp"),
+    sig          = sig_flag(significant)
+  ) %>%
+  select(question, pre_pct_fmt, post_pct_fmt, change_fmt, p_value, sig) %>%
+  kable(
+    col.names = c("Question", "Pre %", "Post %", "Change", "p-value", "Significant?"),
+    caption   = "Two-proportion z-test: pre vs. post % correct",
+    align     = "lccccc"
+  ) %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE) %>%
+  row_spec(which(results_knowledge$significant == TRUE),
+           bold = TRUE, color = "#e63946")
+```
+
+## Visualisation — % Correct Pre vs. Post
+
+```{r knowledge-plot-bar, fig.height=max(4, nrow(results_knowledge) * 0.55 + 1.5)}
+# Grouped horizontal bar chart.
+# Each question has two bars side-by-side (pre = teal, post = orange).
+# Stars mark questions with a statistically significant change.
+
+plot_k <- results_knowledge %>%
+  select(question, pre_pct, post_pct, significant) %>%
+  # Create a display label: add " *" for significant questions
+  mutate(label = ifelse(significant == TRUE, paste0(question, " *"), question)) %>%
+  pivot_longer(c(pre_pct, post_pct), names_to = "time", values_to = "pct_correct") %>%
+  mutate(
+    time = recode(time, pre_pct = "Pre", post_pct = "Post"),
+    time = factor(time, levels = c("Pre", "Post"))
+  )
+
+ggplot(plot_k, aes(x = pct_correct, y = reorder(label, pct_correct), fill = time)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6, colour = "white") +
+  geom_text(aes(label = paste0(round(pct_correct, 1), "%")),
+            position = position_dodge(width = 0.7), hjust = -0.15, size = 3.2) +
+  scale_fill_manual(values = PAL, name = "Time point") +
+  scale_x_continuous(labels = percent_format(scale = 1),
+                     expand = expansion(mult = c(0, 0.18))) +
+  labs(
+    title    = "Knowledge Questions: % Correct Responses",
+    subtitle = "* indicates statistically significant change (p < 0.05)",
+    x = "% Correct", y = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "top", panel.grid.major.y = element_blank(),
+        axis.text.y = element_text(size = 10))
+```
+
+## Visualisation — Percentage-Point Change (Dot Plot)
+
+```{r knowledge-plot-dot, fig.height=max(4, nrow(results_knowledge) * 0.55 + 1.5)}
+# Lollipop / dot plot showing the magnitude of change (Post − Pre) per question.
+# Questions to the right of zero improved; left of zero declined.
+# Red dots indicate statistically significant differences.
+
+ggplot(results_knowledge,
+       aes(x = pct_point_diff,
+           y = reorder(question, pct_point_diff),
+           colour = significant)) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey60") +
+  geom_segment(aes(x = 0, xend = pct_point_diff,
+                   y = question, yend = question),
+               colour = "grey80", linewidth = 0.8) +
+  geom_point(size = 4) +
+  geom_text(
+    aes(
+      label = paste0(ifelse(pct_point_diff >= 0, "+", ""), pct_point_diff, "pp"),
+      hjust = ifelse(pct_point_diff >= 0, -0.3, 1.3)
+    ),
+    size = 3.2
+  ) +
+  scale_colour_manual(
+    values  = c("TRUE" = "#e63946", "FALSE" = "#6c757d"),
+    labels  = c("TRUE" = "Significant (p<.05)", "FALSE" = "Not significant"),
+    na.value = "grey80",
+    name    = NULL
+  ) +
+  scale_x_continuous(
+    labels = function(x) paste0(ifelse(x >= 0, "+", ""), x, "pp"),
+    expand = expansion(mult = 0.25)
+  ) +
+  labs(
+    title    = "Knowledge Questions: Percentage-Point Change (Post − Pre)",
+    subtitle = "Positive = improvement; red = statistically significant",
+    x = "Percentage-point change", y = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "top", panel.grid.major.y = element_blank())
+```
+
+---
+
+# Likert Questions Analysis
+
+> **Statistical method:** Chi-square test comparing the *frequency distribution*
+> of responses across Likert categories (e.g. Strongly Disagree … Strongly Agree)
+> at pre vs. post for each question. We use the distribution rather than just the
+> mean because Likert data is ordinal — the distances between categories are not
+> guaranteed to be equal. Effect size is reported as Cramér's V. Average-score
+> comparisons are descriptive only (no individual-level paired data available).
+
+## Statistical Tests
+
+```{r likert-stats}
+# ══════════════════════════════════════════════════════════════════════════════
+# Likert: chi-square on response distribution
+#
+# For each question we build a 2 × k contingency table:
+#       | SD | D | N | A | SA |
+#   Pre |    |   |   |   |    |
+#  Post |    |   |   |   |    |
+#
+# chisq.test() tests whether the response distribution shifted between waves.
+# When any cell count is < 5 (violating the chi-square approximation),
+# simulate.p.value=TRUE uses a Monte Carlo approximation instead.
+# ══════════════════════════════════════════════════════════════════════════════
+
+log_msg("Running Likert analysis")
+
+# Build category column name vectors from detected stems
+pre_cat_cols  <- paste0("pre_",  l_cat_stems)
+post_cat_cols <- paste0("post_", l_cat_stems)
+pre_score_col  <- if (length(l_score_stem) > 0) paste0("pre_",  l_score_stem[1]) else NULL
+post_score_col <- if (length(l_score_stem) > 0) paste0("post_", l_score_stem[1]) else NULL
+
+log_msg("Likert — category cols: ", length(l_cat_stems),
+        " | score col: ", if(!is.null(pre_score_col)) pre_score_col else "none")
+
+# ── Per-question chi-square ───────────────────────────────────────────────────
+run_chisq <- function(row) {
+  q_label <- if (QUESTION_COL %in% names(row) && !is.null(row[[QUESTION_COL]]))
+               as.character(row[[QUESTION_COL]]) else paste0("Row_", rownames(row))
+
+  pre_counts  <- safe_num(unlist(row[pre_cat_cols]))
+  post_counts <- safe_num(unlist(row[post_cat_cols]))
+
+  # Drop categories where either pre or post is NA
+  # (some questions may not use all Likert levels)
+  valid       <- !is.na(pre_counts) & !is.na(post_counts)
+  pre_counts  <- pre_counts[valid]
+  post_counts <- post_counts[valid]
+
+  if (length(pre_counts) < 2 || sum(pre_counts) == 0 || sum(post_counts) == 0)
+    return(data.frame(
+      question=q_label, pre_avg=NA_real_, post_avg=NA_real_, avg_diff=NA_real_,
+      chi_sq=NA_real_, df=NA_integer_, p_value=NA_real_, cramers_v=NA_real_,
+      significant=NA, note="Insufficient data", stringsAsFactors=FALSE
+    ))
+
+  mat  <- rbind(pre_counts, post_counts)
+  # Use Monte Carlo p-value when any cell < 5 (expected frequency assumption)
+  test <- tryCatch(
+    chisq.test(mat, simulate.p.value = any(mat < 5)),
+    error = function(e) NULL
+  )
+
+  n_pre  <- sum(pre_counts)
+  n_post <- sum(post_counts)
+  k      <- length(pre_counts)
+
+  pre_avg  <- if (!is.null(pre_score_col))
+                safe_num(row[[pre_score_col]]) else NA_real_
+  post_avg <- if (!is.null(post_score_col))
+                safe_num(row[[post_score_col]]) else NA_real_
+
+  data.frame(
+    question    = q_label,
+    pre_avg     = round(pre_avg,  2),
+    post_avg    = round(post_avg, 2),
+    avg_diff    = round(post_avg - pre_avg, 2),
+    chi_sq      = if (!is.null(test)) round(test$statistic, 3) else NA_real_,
+    df          = if (!is.null(test)) as.integer(test$parameter) else NA_integer_,
+    p_value     = if (!is.null(test)) round(test$p.value, 4)  else NA_real_,
+    cramers_v   = if (!is.null(test))
+                    round(cramers_v(test$statistic, n_pre + n_post, k), 3)
+                  else NA_real_,
+    significant = if (!is.null(test)) test$p.value < ALPHA else NA,
+    note        = if (!is.null(test) && any(mat < 5))
+                    "Simulated p-value (low cell counts)" else "",
+    stringsAsFactors = FALSE
+  )
+}
+
+results_likert <- bind_rows(
+  lapply(seq_len(nrow(df_likert)), function(i) run_chisq(df_likert[i, ]))
+)
+
+n_sig_l <- sum(results_likert$significant == TRUE, na.rm = TRUE)
+log_msg("Likert: ", nrow(results_likert), " questions | ", n_sig_l, " significant")
+
+# ── Results table ─────────────────────────────────────────────────────────────
+results_likert %>%
+  mutate(
+    avg_diff_fmt = paste0(ifelse(!is.na(avg_diff) & avg_diff >= 0, "+", ""), avg_diff),
+    sig          = sig_flag(significant)
+  ) %>%
+  select(question, pre_avg, post_avg, avg_diff_fmt,
+         chi_sq, df, p_value, cramers_v, sig) %>%
+  kable(
+    col.names = c("Question", "Pre Avg", "Post Avg", "Δ Avg",
+                  "χ²", "df", "p-value", "Cramér's V", "Significant?"),
+    caption   = paste0(
+      "Chi-square test: distribution of Likert responses pre vs. post\n",
+      "(Cramér's V interpretation: 0.10 = small, 0.30 = medium, 0.50 = large effect)"
+    ),
+    align = "lcccccccc"
+  ) %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE) %>%
+  row_spec(which(results_likert$significant == TRUE),
+           bold = TRUE, color = "#e63946") %>%
+  {
+    # Add footnote only when at least one note exists (avoids empty footnote block)
+    notes <- results_likert$note[nchar(results_likert$note) > 0]
+    if (length(notes) > 0)
+      footnote(., general = notes, general_title = "Notes: ")
+    else .
+  }
+```
+
+## Visualisation — Diverging Stacked Bar Chart
+
+```{r likert-plot-diverging, fig.height=max(5, nrow(df_likert) * 1.2 + 2)}
+# ══════════════════════════════════════════════════════════════════════════════
+# Diverging stacked bar chart
+#
+# This is the standard visualisation for Likert data. Responses are centred
+# at zero (the "neutral" point). Disagree/Strongly Disagree extend left;
+# Agree/Strongly Agree extend right. Neutral is split half-left/half-right
+# so bars are comparable between questions.
+#
+# Each question has two rows: Pre and Post (separated by the question label).
+# ══════════════════════════════════════════════════════════════════════════════
+
+if (length(l_cat_stems) == 0) {
+  message("No Likert category columns detected — skipping diverging chart.")
+} else {
+
+# ── Build long format ─────────────────────────────────────────────────────────
+build_diverging <- function(df, time_label, cat_cols, cat_stems) {
+  df %>%
+    select(all_of(c(QUESTION_COL, cat_cols))) %>%
+    pivot_longer(cols = all_of(cat_cols), names_to = "category", values_to = "count") %>%
+    mutate(
+      # Strip the "pre_" / "post_" prefix to get the bare category name
+      category = str_remove(category, paste0("^", time_label, "_")),
+      time     = time_label,
+      count    = safe_num(count)
+    )
+}
+
+long_pre  <- build_diverging(df_likert, "pre",  pre_cat_cols,  l_cat_stems)
+long_post <- build_diverging(df_likert, "post", post_cat_cols, l_cat_stems)
+
+long_all <- bind_rows(long_pre, long_post) %>%
+  mutate(
+    time     = factor(time, levels = c("pre", "post"), labels = c("Pre", "Post")),
+    category = factor(category,
+                      levels = rev(likert_cat_order[likert_cat_order %in% l_cat_stems]))
+  )
+
+# ── Convert to row percentages ─────────────────────────────────────────────────
+# We show % of respondents rather than raw counts so that questions with
+# different numbers of respondents are directly comparable.
+long_all <- long_all %>%
+  group_by(.data[[QUESTION_COL]], time) %>%
+  mutate(
+    total = sum(count, na.rm = TRUE),
+    pct   = count / total * 100
+  ) %>%
+  ungroup()
+
+# ── Assign direction for diverging layout ─────────────────────────────────────
+# Negative categories (disagree) extend left; positive extend right.
+# Neutral is centred (split equally across the midline).
+long_all <- long_all %>%
+  mutate(
+    direction = case_when(
+      category %in% c("strongly_disagree", "disagree") ~ "negative",
+      category %in% c("agree", "strongly_agree")        ~ "positive",
+      TRUE                                               ~ "neutral"
+    ),
+    pct_directed = case_when(
+      direction == "negative" ~ -pct,
+      direction == "neutral"  ~ -pct / 2,   # half of neutral goes left
+      TRUE                    ~  pct
+    )
+  )
+
+# ── Colour scale (red → grey → blue, colourblind-friendly) ────────────────────
+cat_colours <- c(
+  strongly_disagree = "#d62728",
+  disagree          = "#ff9896",
+  neutral           = "#c7c7c7",
+  agree             = "#aec7e8",
+  strongly_agree    = "#1f77b4"
+)[l_cat_stems]
+cat_colours <- cat_colours[!is.na(cat_colours)]
+
+ggplot(long_all,
+       aes(x    = pct_directed,
+           y    = interaction(.data[[QUESTION_COL]], time, sep = " – "),
+           fill = category)) +
+  geom_col(width = 0.65, colour = "white", linewidth = 0.3) +
+  geom_vline(xintercept = 0, colour = "grey30", linewidth = 0.5) +
+  scale_fill_manual(
+    values = cat_colours,
+    labels = str_to_title(str_replace_all(names(cat_colours), "_", " ")),
+    guide  = guide_legend(reverse = TRUE)
+  ) +
+  scale_x_continuous(
+    labels = function(x) paste0(abs(round(x)), "%"),
+    limits = c(-105, 105),
+    breaks = seq(-100, 100, 25)
+  ) +
+  labs(
+    title    = "Likert Questions: Response Distribution Pre vs. Post",
+    subtitle = "Left = disagree · Right = agree · Neutral split at centre",
+    x = NULL, y = NULL, fill = "Response"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom",
+        panel.grid.major.y = element_blank(),
+        axis.text.y = element_text(size = 9))
+
+} # end if (length(l_cat_stems) > 0)
+```
+
+## Visualisation — Average Score Change
+
+```{r likert-plot-avgscores, fig.height=max(4, nrow(results_likert) * 0.55 + 1.5)}
+# Lollipop chart: change in mean Likert score (Post − Pre) per question.
+# Rendered only when average-score columns were detected in the data.
+# Positive values indicate a more favourable response after the intervention.
+
+if (is.null(pre_score_col)) {
+  message("No avg_score columns detected — skipping average score plot.")
+} else {
+  ggplot(results_likert,
+         aes(x = avg_diff,
+             y = reorder(question, avg_diff),
+             colour = significant)) +
+    geom_vline(xintercept = 0, linetype = "dashed", colour = "grey60") +
+    geom_segment(aes(x = 0, xend = avg_diff, y = question, yend = question),
+                 colour = "grey80", linewidth = 0.8) +
+    geom_point(size = 4) +
+    geom_text(
+      aes(
+        label = paste0(ifelse(avg_diff >= 0, "+", ""), avg_diff),
+        hjust = ifelse(avg_diff >= 0, -0.4, 1.4)
+      ),
+      size = 3.2
+    ) +
+    scale_colour_manual(
+      values   = c("TRUE" = "#e63946", "FALSE" = "#6c757d"),
+      labels   = c("TRUE" = "Significant (p<.05)", "FALSE" = "Not significant"),
+      na.value = "grey80",
+      name     = NULL
+    ) +
+    scale_x_continuous(
+      labels = function(x) paste0(ifelse(x >= 0, "+", ""), x),
+      expand = expansion(mult = 0.25)
+    ) +
+    labs(
+      title    = "Likert Questions: Change in Average Score (Post − Pre)",
+      subtitle = paste0("Scale: ", LIKERT_MIN, "–", LIKERT_MAX,
+                        " | Positive = more favourable post-training"),
+      x = "Change in average score", y = NULL
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(legend.position = "top", panel.grid.major.y = element_blank())
+}
+```
+
+---
+
+# Multi-Select Questions Analysis
+
+> **Statistical method:** Each response option is treated as a binary outcome
+> (selected vs. not selected). A chi-square test compares the distribution of
+> selection counts across all options at pre vs. post for each question.
+> Per-option percentage tables show which specific options shifted most.
+
+## Statistical Tests
+
+```{r multiselect-stats}
+# ══════════════════════════════════════════════════════════════════════════════
+# Multi-Select: chi-square on option-count distribution
+#
+# For each question, we build a 2 × m contingency table (m = number of options):
+#
+#       | Opt A | Opt B | Opt C | … |
+#   Pre |       |       |       |   |
+#  Post |       |       |       |   |
+#
+# The chi-square test asks: did the overall pattern of which options respondents
+# chose change between pre and post?
+# Per-option % rows make it easy to identify which options drove any change.
+# ══════════════════════════════════════════════════════════════════════════════
+
+log_msg("Running Multi-Select analysis")
+
+pre_m_cols  <- paste0("pre_",  m_option_stems)
+post_m_cols <- paste0("post_", m_option_stems)
+
+# Optional total-respondent columns (denominator for % calculation)
+pre_m_total_col  <- if (!is.na(m_total_stem)) paste0("pre_",  m_total_stem) else NULL
+post_m_total_col <- if (!is.na(m_total_stem)) paste0("post_", m_total_stem) else NULL
+
+log_msg("Multi-Select — ", length(m_option_stems), " option stems | ",
+        "total col: ", if(!is.null(pre_m_total_col)) pre_m_total_col else "none")
+
+# ── Per-question chi-square + per-option table ────────────────────────────────
+run_multiselect_test <- function(row) {
+  q_label <- if (QUESTION_COL %in% names(row) && !is.null(row[[QUESTION_COL]]))
+               as.character(row[[QUESTION_COL]]) else paste0("Row_", rownames(row))
+
+  pre_counts  <- safe_num(unlist(row[pre_m_cols]))
+  post_counts <- safe_num(unlist(row[post_m_cols]))
+  names(pre_counts)  <- m_option_stems
+  names(post_counts) <- m_option_stems
+
+  # Determine total respondents (used as denominator for percentages)
+  pre_total  <- if (!is.null(pre_m_total_col))
+    safe_num(row[[pre_m_total_col]]) else sum(pre_counts,  na.rm = TRUE)
+  post_total <- if (!is.null(post_m_total_col))
+    safe_num(row[[post_m_total_col]]) else sum(post_counts, na.rm = TRUE)
+
+  valid <- !is.na(pre_counts) & !is.na(post_counts)
+  mat   <- rbind(pre_counts[valid], post_counts[valid])
+
+  if (sum(valid) < 2 || any(rowSums(mat) == 0))
+    return(data.frame(
+      question=q_label, option=NA_character_,
+      pre_pct=NA_real_, post_pct=NA_real_, diff_pp=NA_real_,
+      chi_sq=NA_real_, p_value=NA_real_, cramers_v=NA_real_,
+      significant=NA, stringsAsFactors=FALSE
+    ))
+
+  test <- tryCatch(
+    chisq.test(mat, simulate.p.value = any(mat < 5)),
+    error = function(e) NULL
+  )
+  n  <- sum(mat)
+  k  <- ncol(mat)
+  cv <- if (!is.null(test)) round(cramers_v(test$statistic, n, k), 3) else NA_real_
+  p  <- if (!is.null(test)) round(test$p.value, 4) else NA_real_
+  cs <- if (!is.null(test)) round(test$statistic, 3) else NA_real_
+
+  # Build one row per option (for granular visualisation)
+  bind_rows(lapply(m_option_stems[valid], function(opt) {
+    ptot <- if (is.na(pre_total)  || pre_total  == 0) NA_real_ else pre_total
+    qtot <- if (is.na(post_total) || post_total == 0) NA_real_ else post_total
+    data.frame(
+      question    = q_label,
+      option      = opt,
+      pre_pct     = round(pre_counts[opt]  / ptot * 100, 1),
+      post_pct    = round(post_counts[opt] / qtot * 100, 1),
+      diff_pp     = round((post_counts[opt]/qtot - pre_counts[opt]/ptot) * 100, 1),
+      chi_sq      = cs,
+      p_value     = p,
+      cramers_v   = cv,
+      significant = if (!is.na(p)) p < ALPHA else NA,
+      stringsAsFactors = FALSE
+    )
+  }))
+}
+
+if (length(m_option_stems) == 0) {
+  log_msg("No option count columns detected in df_multiselect", level = "WARN")
+  results_multiselect <- data.frame()
+} else {
+  results_multiselect <- bind_rows(
+    lapply(seq_len(nrow(df_multiselect)),
+           function(i) run_multiselect_test(df_multiselect[i, ]))
+  )
+  n_sig_m <- sum(results_multiselect$significant == TRUE, na.rm = TRUE)
+  log_msg("Multi-Select: ", nrow(results_multiselect), " option rows | ",
+          n_sig_m, " significant")
+
+  results_multiselect %>%
+    mutate(
+      pre_pct_fmt  = paste0(pre_pct,  "%"),
+      post_pct_fmt = paste0(post_pct, "%"),
+      diff_fmt     = paste0(ifelse(diff_pp >= 0, "+", ""), diff_pp, "pp"),
+      sig          = sig_flag(significant)
+    ) %>%
+    select(question, option, pre_pct_fmt, post_pct_fmt, diff_fmt,
+           chi_sq, p_value, cramers_v, sig) %>%
+    kable(
+      col.names = c("Question", "Option", "Pre %", "Post %", "Change",
+                    "χ²", "p-value", "Cramér's V", "Significant?"),
+      caption   = "Multi-Select: chi-square test on option selection rates"
+    ) %>%
+    kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                  full_width = FALSE) %>%
+    row_spec(which(results_multiselect$significant == TRUE),
+             bold = TRUE, color = "#e63946")
+}
+```
+
+## Visualisation — Option Selection Rates
+
+```{r multiselect-plot, fig.height=max(5, nrow(results_multiselect) * 0.45 + 2)}
+# Grouped horizontal bar chart.
+# Each bar represents the % of respondents who selected a given option.
+# Options are labelled "Question — Option Name" for easy reading.
+# Stars mark options belonging to questions with significant overall shifts.
+
+if (nrow(results_multiselect) > 0) {
+  plot_m <- results_multiselect %>%
+    mutate(
+      label_base = paste0(question, " — ",
+                          str_to_title(str_replace_all(option, "_", " "))),
+      label      = ifelse(!is.na(significant) & significant,
+                          paste0(label_base, " *"), label_base)
+    ) %>%
+    pivot_longer(c(pre_pct, post_pct), names_to = "time", values_to = "pct") %>%
+    mutate(
+      time = recode(time, pre_pct = "Pre", post_pct = "Post"),
+      time = factor(time, levels = c("Pre", "Post"))
+    )
+
+  ggplot(plot_m, aes(x = pct, y = reorder(label, pct), fill = time)) +
+    geom_col(position = position_dodge(width = 0.7), width = 0.6, colour = "white") +
+    geom_text(aes(label = paste0(round(pct, 1), "%")),
+              position = position_dodge(width = 0.7), hjust = -0.15, size = 3) +
+    scale_fill_manual(values = PAL, name = "Time point") +
+    scale_x_continuous(labels = percent_format(scale = 1),
+                       expand = expansion(mult = c(0, 0.2))) +
+    labs(
+      title    = "Multi-Select: % of Respondents Selecting Each Option",
+      subtitle = "* indicates statistically significant distribution shift (p < 0.05)",
+      x = "% Selected", y = NULL
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(legend.position = "top", panel.grid.major.y = element_blank(),
+          axis.text.y = element_text(size = 9))
+}
+```
+
+---
+
+# Summary Table {#summary}
+
+```{r summary-table}
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 12 — COMBINED RESULTS SUMMARY
+#
+# All four question types are merged into a single sorted table.
+# This is the at-a-glance view for stakeholders — it shows which questions
+# changed significantly and by how much, regardless of question type.
+# ══════════════════════════════════════════════════════════════════════════════
+
+log_msg("Building combined summary table")
+
+# ── Perception Slider ─────────────────────────────────────────────────────────
+summary_s <- if (nrow(results_slider) > 0) {
+  results_slider %>%
+    transmute(
+      question    = question,
+      type        = "Perception Slider",
+      metric      = paste0("mean: ", pre_mean, " → ", post_mean),
+      change      = paste0(ifelse(diff >= 0 | grepl("^\\+", diff), "+", ""), diff),
+      p_value     = p_value,
+      effect_size = ifelse(!is.na(cohens_d), paste0("d = ", cohens_d), "—"),
+      significant = significant
+    )
+} else data.frame()
+
+# ── Knowledge ─────────────────────────────────────────────────────────────────
+summary_k <- results_knowledge %>%
+  transmute(
+    question    = question,
+    type        = "Knowledge",
+    metric      = paste0("% correct: ", pre_pct, "% → ", post_pct, "%"),
+    change      = paste0(ifelse(pct_point_diff >= 0, "+", ""),
+                         pct_point_diff, "pp"),
+    p_value     = p_value,
+    effect_size = paste0(abs(pct_point_diff), "pp"),
+    significant = significant
+  )
+
+# ── Likert ────────────────────────────────────────────────────────────────────
+summary_l <- results_likert %>%
+  transmute(
+    question    = question,
+    type        = "Likert",
+    metric      = if (!is.null(pre_score_col))
+                    paste0("avg score: ", pre_avg, " → ", post_avg)
+                  else paste0("χ² = ", chi_sq),
+    change      = if (!is.null(pre_score_col))
+                    paste0(ifelse(!is.na(avg_diff) & avg_diff >= 0, "+", ""), avg_diff)
+                  else NA_character_,
+    p_value     = p_value,
+    effect_size = ifelse(!is.na(cramers_v), paste0("V = ", cramers_v), "—"),
+    significant = significant
+  )
+
+# ── Multi-Select (one row per question, summarised across options) ─────────────
+summary_m <- if (nrow(results_multiselect) > 0) {
+  results_multiselect %>%
+    group_by(question) %>%
+    summarise(
+      n_sig  = sum(significant == TRUE, na.rm = TRUE),
+      n_opts = n(),
+      p_min  = min(p_value,  na.rm = TRUE),
+      v_max  = max(cramers_v, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    transmute(
+      question    = question,
+      type        = "Multi-Select",
+      metric      = paste0(n_sig, "/", n_opts, " options changed"),
+      change      = NA_character_,
+      p_value     = round(p_min, 4),
+      effect_size = paste0("V = ", round(v_max, 3)),
+      significant = p_min < ALPHA
+    )
+} else data.frame()
+
+# ── Combine and render ─────────────────────────────────────────────────────────
+combined_summary <- bind_rows(summary_s, summary_k, summary_l, summary_m) %>%
+  arrange(type, p_value)
+
+log_msg("Summary: ", nrow(combined_summary), " total items across all question types")
+
+combined_summary %>%
+  mutate(sig = sig_flag(significant)) %>%
+  select(type, question, metric, change, p_value, effect_size, sig) %>%
+  kable(
+    col.names = c("Type", "Question", "Pre → Post", "Change",
+                  "p-value", "Effect Size", "Sig."),
+    caption   = paste(REPORT_TITLE, "| Complete Results Summary"),
+    align     = "llllccl"
+  ) %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = TRUE) %>%
+  {
+    tbl <- .
+    type_order <- c("Perception Slider", "Knowledge", "Likert", "Multi-Select")
+    for (tp in type_order) {
+      rows <- which(combined_summary$type == tp)
+      if (length(rows) > 0)
+        tbl <- pack_rows(tbl, tp, min(rows), max(rows), bold = TRUE)
+    }
+    tbl
+  } %>%
+  row_spec(which(combined_summary$significant == TRUE),
+           bold = TRUE, color = "#e63946")
+```
+
+---
+
+# Session Info
+
+```{r session-info, echo=FALSE}
+# ══════════════════════════════════════════════════════════════════════════════
+# REPRODUCIBILITY RECORD
+#
+# The output below records the exact R version and package versions used
+# when this report was generated. If results ever differ between runs,
+# this information helps diagnose version-related causes.
+# ══════════════════════════════════════════════════════════════════════════════
+log_msg("Report complete — recording session info")
+sessionInfo()
+```
